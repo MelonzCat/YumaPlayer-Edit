@@ -1,0 +1,56 @@
+/*
+ * YumaPlayer (2026) | Modified work by MuwMix
+ * ArchiveTune (2026) | Original work by © Rukamori
+ * GPL-3.0 License | Contributors: see git history
+ */
+
+package moe.rukamori.archivetune.home
+
+import android.content.Context
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import moe.rukamori.archivetune.constants.DisableBlurKey
+import moe.rukamori.archivetune.constants.QuickPicksDisplayMode
+import moe.rukamori.archivetune.constants.QuickPicksDisplayModeKey
+import moe.rukamori.archivetune.constants.ShowHomeCategoryChipsKey
+import moe.rukamori.archivetune.extensions.toEnum
+import moe.rukamori.archivetune.innertube.YouTube
+import moe.rukamori.archivetune.innertube.models.SongItem
+import moe.rukamori.archivetune.utils.dataStore
+import javax.inject.Inject
+
+class HomeRepository
+    @Inject
+    constructor(
+        @ApplicationContext context: Context,
+    ) {
+        val showCategoryChips: Flow<Boolean> =
+            context.dataStore.data
+                .map { preferences -> preferences[ShowHomeCategoryChipsKey] ?: true }
+                .distinctUntilChanged()
+
+        val quickPicksDisplayMode: Flow<QuickPicksDisplayMode> =
+            context.dataStore.data
+                .map { preferences ->
+                    preferences[QuickPicksDisplayModeKey].toEnum(QuickPicksDisplayMode.HERO)
+                }.distinctUntilChanged()
+
+        val showTonalBackdrop: Flow<Boolean> =
+            context.dataStore.data
+                .map { preferences -> preferences[DisableBlurKey] != true }
+                .distinctUntilChanged()
+
+        suspend fun loadPlaylistPreview(
+            playlistId: String,
+            limit: Int,
+        ): Result<List<SongItem>> {
+            val result = YouTube.playlist(playlistId)
+            result.exceptionOrNull()?.let { throwable ->
+                if (throwable is CancellationException) throw throwable
+            }
+            return result.map { page -> page.songs.take(limit.coerceAtLeast(0)) }
+        }
+    }

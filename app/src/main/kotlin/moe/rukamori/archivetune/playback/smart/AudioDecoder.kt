@@ -1,0 +1,939 @@
+package moe.rukamori.archivetune.playback.smart
+
+import android.content.Context
+import android.media.AudioFormat
+import android.media.MediaCodec
+import android.media.MediaDataSource
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.net.Uri
+import androidx.media3.datasource.cache.Cache
+import androidx.media3.datasource.cache.ContentMetadata
+import eu.buney.kopus.OpusDecoder
+import eu.buney.kopus.OpusLoader
+import moe.rukamori.archivetune.audiodsp.FloatChunkList
+import java.io.File
+import java.io.FileDescriptor
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import timber.log.Timber
+import kotlin.math.roundToInt
+
+object AudioDecoder {
+    private const val TIMEOUT_US = 10_000L
+    private const val MAX_CONSECUTIVE_TIMEOUTS = 50
+    const val TARGET_SAMPLE_RATE: Double = 11025.0
+    const val DEFAULT_HEAD_DECODE_MS: Long = 30_000L
+    const val MAX_HEAD_DECODE_MS: Long = 45_000L
+    const val TAIL_WINDOW_MS: Long = 45_000L
+    const val DECODE_WATCHDOG_MS: Long = 45_000L
+    const val MAX_FULL_DECODE_MS: Long = 720_000L
+
+    fun decode(
+        filePath: String,
+        startMs: Long = 0L,
+        endMs: Long = DEFAULT_HEAD_DECODE_MS,
+    ): FloatArray? {
+        if (filePath.startsWith("http://", ignoreCase = true) || filePath.startsWith("https://", ignoreCase = true)) {
+            return null
+        }
+        val file = File(filePath)
+        if (!file.exists() || !file.canRead()) return null
+        return decodeInternal(
+            setDataSource = { it.setDataSource(file.absolutePath) },
+            startMs = startMs,
+            endMs = endMs,
+        )
+    }
+
+    fun decode(
+        file: File,
+        startMs: Long = 0L,
+        endMs: Long = DEFAULT_HEAD_DECODE_MS,
+    ): FloatArray? {
+        if (!file.exists() || !file.canRead()) return null
+        return decodeInternal(
+            setDataSource = { it.setDataSource(file.absolutePath) },
+            startMs = startMs,
+            endMs = endMs,
+        )
+    }
+
+    fun decode(
+        context: Context,
+        uri: Uri,
+        startMs: Long = 0L,
+        endMs: Long = DEFAULT_HEAD_DECODE_MS,
+    ): FloatArray? {
+        val scheme = uri.scheme?.lowercase()
+        if (scheme == "http" || scheme == "https") return null
+        if (scheme != "file" && scheme != "content" && scheme != "android.resource" && scheme != null) {
+            return null
+        }
+        if (scheme == "file" || scheme == null) {
+            val path = uri.path
+            if (path != null) {
+                val file = File(path)
+                if (file.exists() && file.canRead()) {
+                    return decode(file, startMs, endMs)
+                }
+            }
+        }
+        return runCatching {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                decode(pfd.fileDescriptor, 0L, Long.MAX_VALUE, startMs, endMs)
+            }
+        }.getOrNull()
+    }
+
+    fun decode(
+        fd: FileDescriptor,
+        offset: Long = 0L,
+        length: Long = Long.MAX_VALUE,
+        startMs: Long = 0L,
+        endMs: Long = DEFAULT_HEAD_DECODE_MS,
+    ): FloatArray? = decodeInternal(
+        setDataSource = { it.setDataSource(fd, offset, length) },
+        startMs = startMs,
+        endMs = endMs,
+    )
+
+    fun decode(
+        mediaDataSource: MediaDataSource,
+        startMs: Long = 0L,
+        endMs: Long = DEFAULT_HEAD_DECODE_MS,
+    ): FloatArray? = decodeInternal(
+        setDataSource = { it.setDataSource(mediaDataSource) },
+        startMs = startMs,
+        endMs = endMs,
+    )
+
+    fun decode(
+        cache: Cache,
+        cacheKey: String,
+        startMs: Long = 0L,
+        endMs: Long = DEFAULT_HEAD_DECODE_MS,
+    ): FloatArray? {
+        val length = runCatching {
+            cache.getContentMetadata(cacheKey).get(ContentMetadata.KEY_CONTENT_LENGTH, -1L)
+        }.getOrDefault(-1L)
+        if (length <= 0L || !cache.isCached(cacheKey, 0L, length)) {
+            return null
+        }
+        val spans = runCatching { cache.getCachedSpans(cacheKey) }.getOrNull().orEmpty()
+        if (spans.isEmpty()) return null
+        if (spans.size == 1) {
+            val singleFile = spans.first().file
+            if (singleFile != null && singleFile.exists() && singleFile.canRead()) {
+                return decode(singleFile, startMs, endMs)
+            }
+        }
+        return decode(CacheMediaDataSource(cache, cacheKey), startMs, endMs)
+    }
+
+    fun decodeTail(
+        filePath: String,
+        durationMs: Long,
+    ): FloatArray? {
+        if (durationMs <= TAIL_WINDOW_MS) return null
+        return decode(filePath, startMs = durationMs - TAIL_WINDOW_MS, endMs = durationMs)
+    }
+
+    fun decodeTail(
+        file: File,
+        durationMs: Long,
+    ): FloatArray? {
+        if (durationMs <= TAIL_WINDOW_MS) return null
+        return decode(file, startMs = durationMs - TAIL_WINDOW_MS, endMs = durationMs)
+    }
+
+    fun decodeTail(
+        context: Context,
+        uri: Uri,
+        durationMs: Long,
+    ): FloatArray? {
+        if (durationMs <= TAIL_WINDOW_MS) return null
+        return decode(context, uri, startMs = durationMs - TAIL_WINDOW_MS, endMs = durationMs)
+    }
+
+    fun decodeTail(
+        fd: FileDescriptor,
+        offset: Long = 0L,
+        length: Long = Long.MAX_VALUE,
+        durationMs: Long,
+    ): FloatArray? {
+        if (durationMs <= TAIL_WINDOW_MS) return null
+        return decode(fd, offset, length, startMs = durationMs - TAIL_WINDOW_MS, endMs = durationMs)
+    }
+
+    fun decodeTail(
+        mediaDataSource: MediaDataSource,
+        durationMs: Long,
+    ): FloatArray? {
+        if (durationMs <= TAIL_WINDOW_MS) return null
+        return decode(mediaDataSource, startMs = durationMs - TAIL_WINDOW_MS, endMs = durationMs)
+    }
+
+    fun decodeTail(
+        cache: Cache,
+        cacheKey: String,
+        durationMs: Long,
+    ): FloatArray? {
+        if (durationMs <= TAIL_WINDOW_MS) return null
+        return decode(cache, cacheKey, startMs = durationMs - TAIL_WINDOW_MS, endMs = durationMs)
+    }
+
+    fun canDoFullPass(durationMs: Long?): Boolean =
+        durationMs != null && durationMs > TAIL_WINDOW_MS && durationMs <= MAX_FULL_DECODE_MS
+
+    fun fullPassWatchdogMs(durationMs: Long): Long =
+        (durationMs / 2 + 30_000L).coerceIn(DECODE_WATCHDOG_MS, 300_000L)
+
+    fun decodeFull(
+        context: Context,
+        uri: Uri,
+        durationMs: Long,
+    ): FloatArray? {
+        if (!canDoFullPass(durationMs)) return null
+        val scheme = uri.scheme?.lowercase()
+        if (scheme == "http" || scheme == "https") return null
+        if (scheme == "file" || scheme == null) {
+            val path = uri.path
+            if (path != null) {
+                val file = File(path)
+                if (file.exists() && file.canRead()) {
+                    return decodeFull(file, durationMs)
+                }
+            }
+        }
+        val watchdog = fullPassWatchdogMs(durationMs)
+        val viaFramework = try {
+            decodeInternal(
+                setDataSource = { it.setDataSource(context, uri, null) },
+                startMs = 0L,
+                endMs = durationMs,
+                maxWindowMs = MAX_FULL_DECODE_MS,
+                watchdogMs = watchdog,
+                decimateToTargetRate = true,
+            )
+        } catch (e: Exception) {
+            Timber.tag("AudioDecoder").e(e, "decodeFull(context-uri) failed uri=$uri durationMs=$durationMs")
+            null
+        }
+        if (viaFramework != null && viaFramework.isNotEmpty()) return viaFramework
+        if (viaFramework == null) {
+            Timber.tag("AudioDecoder").w("decodeFull(context-uri) yielded no samples uri=$uri durationMs=$durationMs, trying fd fallback")
+        }
+        return try {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                val fdLength = pfd.statSize.takeIf { it > 0 } ?: Long.MAX_VALUE
+                decodeInternal(
+                    setDataSource = { it.setDataSource(pfd.fileDescriptor, 0L, fdLength) },
+                    startMs = 0L,
+                    endMs = durationMs,
+                    maxWindowMs = MAX_FULL_DECODE_MS,
+                    watchdogMs = watchdog,
+                    decimateToTargetRate = true,
+                )
+            }
+        } catch (e: Exception) {
+            Timber.tag("AudioDecoder").e(e, "decodeFull(fd-fallback) failed uri=$uri durationMs=$durationMs")
+            null
+        }
+    }
+
+    fun decodeFull(
+        file: File,
+        durationMs: Long,
+    ): FloatArray? {
+        if (!canDoFullPass(durationMs)) return null
+        if (!file.exists() || !file.canRead()) return null
+        return decodeInternal(
+            setDataSource = { it.setDataSource(file.absolutePath) },
+            startMs = 0L,
+            endMs = durationMs,
+            maxWindowMs = MAX_FULL_DECODE_MS,
+            watchdogMs = fullPassWatchdogMs(durationMs),
+            decimateToTargetRate = true,
+        )
+    }
+
+    fun decodeFull(
+        cache: Cache,
+        cacheKey: String,
+        durationMs: Long,
+    ): FloatArray? {
+        if (!canDoFullPass(durationMs)) return null
+        val length = try {
+            cache.getContentMetadata(cacheKey).get(ContentMetadata.KEY_CONTENT_LENGTH, -1L)
+        } catch (e: Exception) {
+            Timber.tag("AudioDecoder").e(e, "decodeFull(cache) metadata failed key=$cacheKey")
+            -1L
+        }
+        if (length <= 0L || !cache.isCached(cacheKey, 0L, length)) {
+            return null
+        }
+        val spans = try {
+            cache.getCachedSpans(cacheKey)
+        } catch (e: Exception) {
+            Timber.tag("AudioDecoder").e(e, "decodeFull(cache) spans failed key=$cacheKey")
+            null
+        }.orEmpty()
+        if (spans.isEmpty()) return null
+        if (spans.size == 1) {
+            val singleFile = spans.first().file
+            if (singleFile != null && singleFile.exists() && singleFile.canRead()) {
+                return decodeFull(singleFile, durationMs)
+            }
+        }
+        return decodeInternal(
+            setDataSource = { it.setDataSource(CacheMediaDataSource(cache, cacheKey)) },
+            startMs = 0L,
+            endMs = durationMs,
+            maxWindowMs = MAX_FULL_DECODE_MS,
+            watchdogMs = fullPassWatchdogMs(durationMs),
+            decimateToTargetRate = true,
+        )
+    }
+
+    private fun decodeInternal(
+        setDataSource: (MediaExtractor) -> Unit,
+        startMs: Long,
+        endMs: Long,
+        maxWindowMs: Long = MAX_HEAD_DECODE_MS,
+        watchdogMs: Long = DECODE_WATCHDOG_MS,
+        decimateToTargetRate: Boolean = false,
+    ): FloatArray? {
+        val extractor = MediaExtractor()
+        var codec: MediaCodec? = null
+
+        return try {
+            setDataSource(extractor)
+
+            var audioTrackIndex = -1
+            var audioFormat: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                if (mime.startsWith("audio/")) {
+                    audioTrackIndex = i
+                    audioFormat = format
+                    break
+                }
+            }
+
+            if (audioTrackIndex == -1 || audioFormat == null) {
+                return null
+            }
+
+            extractor.selectTrack(audioTrackIndex)
+
+            val mime = audioFormat.getString(MediaFormat.KEY_MIME) ?: return null
+
+            val safeStartMs = startMs.coerceAtLeast(0L)
+            val requestedEndMs = if (endMs <= safeStartMs || endMs == Long.MAX_VALUE) {
+                safeStartMs + DEFAULT_HEAD_DECODE_MS
+            } else {
+                endMs
+            }
+            val boundedEndMs = requestedEndMs.coerceAtMost(safeStartMs + maxWindowMs)
+            val startUs = safeStartMs * 1000L
+            val endUs = boundedEndMs * 1000L
+            if (startUs > 0L) {
+                extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            }
+
+            var sampleRate = if (audioFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            } else {
+                44100
+            }
+            if (sampleRate <= 0) sampleRate = 44100
+
+            var channelCount = if (audioFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            } else {
+                2
+            }
+            if (channelCount <= 0) channelCount = 1
+
+            val decodeStartMs = android.os.SystemClock.elapsedRealtime()
+
+            if (mime.equals("audio/opus", ignoreCase = true)) {
+                val kopusSamples = runCatching {
+                    decodeOpusInternal(
+                        extractor = extractor,
+                        sampleRate = sampleRate,
+                        channelCount = channelCount,
+                        startUs = startUs,
+                        endUs = endUs,
+                        watchdogMs = watchdogMs,
+                        decimateToTargetRate = decimateToTargetRate,
+                        decodeStartMs = decodeStartMs,
+                    )
+                }.getOrNull()
+
+                if (kopusSamples != null && kopusSamples.isNotEmpty()) {
+                    return kopusSamples
+                }
+
+                if (startUs > 0L) {
+                    extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                } else {
+                    extractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                }
+            }
+
+            codec = MediaCodec.createDecoderByType(mime)
+            codec.configure(audioFormat, null, null, 0)
+            codec.start()
+            val decoderForLog: MediaCodec? = codec
+            val decoderName = runCatching { decoderForLog?.name }.getOrNull() ?: "MediaCodec"
+
+            var pcmEncoding = if (audioFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                audioFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
+            } else {
+                AudioFormat.ENCODING_PCM_16BIT
+            }
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var sawInputEOS = false
+            var sawOutputEOS = false
+            var consecutiveTimeouts = 0
+            val collector = FloatChunkList()
+            val decimateTargetRate = if (decimateToTargetRate) {
+                runCatching { TrackFeatures.sampleRate() }
+                    .getOrDefault(TARGET_SAMPLE_RATE)
+                    .takeIf { it.isFinite() && it > 0.0 } ?: TARGET_SAMPLE_RATE
+            } else {
+                Double.NaN
+            }
+            val decimateSink = if (decimateToTargetRate) {
+                DecimatingSink(collector, strideFor(sampleRate, decimateTargetRate))
+            } else {
+                null
+            }
+            var wallClockAborted = false
+
+            while (!sawOutputEOS) {
+                if (android.os.SystemClock.elapsedRealtime() - decodeStartMs > watchdogMs) {
+                    Timber.tag("AudioDecoder").w("Decode wall-clock guard tripped after ${watchdogMs}ms; stopping decode loop")
+                    wallClockAborted = true
+                    break
+                }
+                if (!sawInputEOS) {
+                    val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
+                    if (inputIndex >= 0) {
+                        val inputBuffer = codec.getInputBuffer(inputIndex)
+                        if (inputBuffer == null) {
+                            sawInputEOS = true
+                        } else {
+                            inputBuffer.clear()
+                            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                            if (sampleSize < 0) {
+                                codec.queueInputBuffer(
+                                    inputIndex,
+                                    0,
+                                    0,
+                                    0L,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+                                )
+                                sawInputEOS = true
+                            } else {
+                                val sampleTime = extractor.sampleTime
+                                val isPastEnd = sampleTime > endUs
+                                val flags = if (isPastEnd) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+                                codec.queueInputBuffer(inputIndex, 0, sampleSize, sampleTime, flags)
+                                val advanced = runCatching { extractor.advance() }.getOrDefault(false)
+                                if (isPastEnd || !advanced) {
+                                    sawInputEOS = true
+                                }
+                            }
+                        }
+                    }
+                }
+
+                val outputIndex = codec.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+                when {
+                    outputIndex >= 0 -> {
+                        consecutiveTimeouts = 0
+                        if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                            sawOutputEOS = true
+                        }
+                        val outputBuffer = codec.getOutputBuffer(outputIndex)
+                        if (outputBuffer != null && bufferInfo.size > 0) {
+                            outputBuffer.position(bufferInfo.offset)
+                            outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                            outputBuffer.order(ByteOrder.LITTLE_ENDIAN)
+
+                            val stopped = if (decimateSink != null) {
+                                extractMonoSamplesDecimated(
+                                    buffer = outputBuffer,
+                                    bufferSize = bufferInfo.size,
+                                    presentationTimeUs = bufferInfo.presentationTimeUs,
+                                    channelCount = channelCount,
+                                    sampleRate = sampleRate,
+                                    pcmEncoding = pcmEncoding,
+                                    startUs = startUs,
+                                    endUs = endUs,
+                                    sink = decimateSink,
+                                )
+                            } else {
+                                extractMonoSamples(
+                                    buffer = outputBuffer,
+                                    bufferSize = bufferInfo.size,
+                                    presentationTimeUs = bufferInfo.presentationTimeUs,
+                                    channelCount = channelCount,
+                                    sampleRate = sampleRate,
+                                    pcmEncoding = pcmEncoding,
+                                    startUs = startUs,
+                                    endUs = endUs,
+                                    collector = collector,
+                                )
+                            }
+                            if (stopped) {
+                                sawOutputEOS = true
+                            }
+                        }
+                        codec.releaseOutputBuffer(outputIndex, false)
+                    }
+
+                    outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        consecutiveTimeouts = 0
+                        val newFormat = codec.outputFormat
+                        if (newFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                            sampleRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                            if (sampleRate <= 0) sampleRate = 44100
+                        }
+                        if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                            channelCount = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                            if (channelCount <= 0) channelCount = 1
+                        }
+                        if (newFormat.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
+                            pcmEncoding = newFormat.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                        }
+                        if (decimateSink != null) {
+                            decimateSink.retune(strideFor(sampleRate, decimateTargetRate))
+                        }
+                    }
+
+                    outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        consecutiveTimeouts++
+                        if (sawInputEOS && consecutiveTimeouts > MAX_CONSECUTIVE_TIMEOUTS) {
+                            break
+                        }
+                    }
+                }
+            }
+
+            decimateSink?.flush()
+            var monoSamples: FloatArray? = collector.toFloatArray()
+            if (wallClockAborted) {
+                Timber.tag("AudioDecoder").w("Decode stopped by watchdog, keeping ${monoSamples?.size ?: 0} decoded samples")
+            }
+            if (monoSamples == null || monoSamples.isEmpty()) {
+                monoSamples = null
+                return null
+            }
+            if (decimateSink != null) {
+                val decimated = monoSamples
+                monoSamples = null
+                Timber.tag("AudioDecoder").d("decode ${android.os.SystemClock.elapsedRealtime() - decodeStartMs}ms via $decoderName (mono, ${decimated.size} samples)")
+                return decimated
+            }
+
+            val targetRate = runCatching { TrackFeatures.sampleRate() }.getOrDefault(TARGET_SAMPLE_RATE)
+            if (sampleRate.toDouble() == targetRate) {
+                val direct = monoSamples
+                monoSamples = null
+                Timber.tag("AudioDecoder").d("decode ${android.os.SystemClock.elapsedRealtime() - decodeStartMs}ms via $decoderName (mono, ${direct.size} samples)")
+                return direct
+            }
+            val source = monoSamples
+            monoSamples = null
+            val resampled = runCatching {
+                TrackFeatures.resample(source, sampleRate.toDouble(), targetRate)
+            }.getOrNull() ?: source
+            Timber.tag("AudioDecoder").d("decode ${android.os.SystemClock.elapsedRealtime() - decodeStartMs}ms via $decoderName (mono, ${resampled.size} samples)")
+            return resampled
+        } catch (e: Exception) {
+            Timber.tag("AudioDecoder").e(e, "Decode failed")
+            null
+        } finally {
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            runCatching { extractor.release() }
+        }
+    }
+
+    private val opusLoadLock = Any()
+
+    @Volatile
+    private var opusNativeUsable: Boolean? = null
+
+    private fun openOpusDecoder(sampleRate: Int, channels: Int): OpusDecoder? {
+        if (opusNativeUsable == false) return null
+        if (channels !in 1..2) return null
+        synchronized(opusLoadLock) {
+            if (opusNativeUsable == false) return null
+            try {
+                OpusLoader.load()
+            } catch (error: Throwable) {
+                Timber.tag("AudioDecoder").w(error, "Opus native library unavailable, using platform decoder")
+                opusNativeUsable = false
+                return null
+            }
+        }
+        return try {
+            OpusDecoder(sampleRate, channels).also { opusNativeUsable = true }
+        } catch (error: LinkageError) {
+            Timber.tag("AudioDecoder").w(error, "Opus native decoder unusable, using platform decoder")
+            opusNativeUsable = false
+            null
+        } catch (error: Throwable) {
+            Timber.tag("AudioDecoder").w(error, "Failed to create OpusDecoder, using platform decoder")
+            null
+        }
+    }
+
+    private fun closestOpusRate(rate: Int): Int {
+        val rates = intArrayOf(8000, 12000, 16000, 24000, 48000)
+        return rates.minByOrNull { kotlin.math.abs(it - rate) } ?: 48000
+    }
+
+    private fun decodeOpusInternal(
+        extractor: MediaExtractor,
+        sampleRate: Int,
+        channelCount: Int,
+        startUs: Long,
+        endUs: Long,
+        watchdogMs: Long,
+        decimateToTargetRate: Boolean,
+        decodeStartMs: Long,
+    ): FloatArray? {
+        val validChannels = if (channelCount > 0) channelCount else 1
+        val opusSampleRate = closestOpusRate(sampleRate)
+        val decoder = openOpusDecoder(opusSampleRate, validChannels) ?: return null
+
+        val collector = FloatChunkList()
+        val decimateTargetRate = if (decimateToTargetRate) {
+            runCatching { TrackFeatures.sampleRate() }
+                .getOrDefault(TARGET_SAMPLE_RATE)
+                .takeIf { it.isFinite() && it > 0.0 } ?: TARGET_SAMPLE_RATE
+        } else {
+            Double.NaN
+        }
+        val decimateSink = if (decimateToTargetRate) {
+            DecimatingSink(collector, strideFor(opusSampleRate, decimateTargetRate))
+        } else {
+            null
+        }
+
+        val inputBuffer = ByteBuffer.allocateDirect(32768)
+        var reusableData = ByteArray(32768)
+        val outPcm = FloatArray(5760 * validChannels)
+        val frameDurationUs = 1_000_000.0 / opusSampleRate
+        val invChannels = 1.0f / validChannels
+
+        try {
+            while (true) {
+                if (android.os.SystemClock.elapsedRealtime() - decodeStartMs > watchdogMs) {
+                    Timber.tag("AudioDecoder").w("Kopus decode wall-clock guard tripped after ${watchdogMs}ms")
+                    break
+                }
+
+                val packetTimeUs = extractor.sampleTime
+                if (packetTimeUs < 0L || packetTimeUs > endUs) {
+                    break
+                }
+
+                inputBuffer.clear()
+                val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                if (sampleSize <= 0) {
+                    break
+                }
+
+                if (sampleSize > reusableData.size) {
+                    reusableData = ByteArray(sampleSize)
+                }
+                inputBuffer.position(0)
+                inputBuffer.get(reusableData, 0, sampleSize)
+
+                val decodedSamples = decoder.decode(reusableData, 0, sampleSize, outPcm, 0, 5760, false)
+                if (decodedSamples > 0) {
+                    val packetEndUs = packetTimeUs + (decodedSamples * frameDurationUs).toLong()
+                    if (packetEndUs >= startUs) {
+                        var reachedEnd = false
+                        for (i in 0 until decodedSamples) {
+                            val frameTimeUs = packetTimeUs + (i * frameDurationUs).toLong()
+                            if (frameTimeUs < startUs) continue
+                            if (frameTimeUs > endUs) {
+                                reachedEnd = true
+                                break
+                            }
+                            var sum = 0f
+                            val base = i * validChannels
+                            for (c in 0 until validChannels) {
+                                sum += outPcm[base + c]
+                            }
+                            val mono = (sum * invChannels).coerceIn(-1.0f, 1.0f)
+                            if (decimateSink != null) {
+                                decimateSink.push(mono)
+                            } else {
+                                collector.add(mono)
+                            }
+                        }
+                        if (reachedEnd) break
+                    }
+                }
+
+                val advanced = runCatching { extractor.advance() }.getOrDefault(false)
+                if (!advanced) break
+            }
+        } catch (e: Throwable) {
+            Timber.tag("AudioDecoder").w(e, "Kopus decode failed, falling back to MediaCodec")
+            return null
+        } finally {
+            runCatching { decoder.close() }
+        }
+
+        decimateSink?.flush()
+        var monoSamples: FloatArray? = collector.toFloatArray()
+        if (monoSamples == null || monoSamples.isEmpty()) {
+            return null
+        }
+
+        if (decimateSink != null) {
+            val decimated = monoSamples
+            Timber.tag("AudioDecoder").d(
+                "decode ${android.os.SystemClock.elapsedRealtime() - decodeStartMs}ms via Kopus (mono, ${decimated.size} samples)"
+            )
+            return decimated
+        }
+
+        val targetRate = runCatching { TrackFeatures.sampleRate() }.getOrDefault(TARGET_SAMPLE_RATE)
+        if (opusSampleRate.toDouble() == targetRate) {
+            val direct = monoSamples
+            Timber.tag("AudioDecoder").d(
+                "decode ${android.os.SystemClock.elapsedRealtime() - decodeStartMs}ms via Kopus (mono, ${direct.size} samples)"
+            )
+            return direct
+        }
+
+        val source = monoSamples
+        val resampled = runCatching {
+            TrackFeatures.resample(source, opusSampleRate.toDouble(), targetRate)
+        }.getOrNull() ?: source
+        Timber.tag("AudioDecoder").d(
+            "decode ${android.os.SystemClock.elapsedRealtime() - decodeStartMs}ms via Kopus (mono, ${resampled.size} samples)"
+        )
+        return resampled
+    }
+
+    private fun strideFor(nativeRate: Int, targetRate: Double): Int {
+        if (!targetRate.isFinite() || targetRate <= 0.0 || nativeRate <= 0) return 1
+        return (nativeRate / targetRate).roundToInt().coerceAtLeast(1)
+    }
+
+    private class DecimatingSink(
+        private val out: FloatChunkList,
+        var stride: Int,
+    ) {
+        private var acc = 0.0
+        private var count = 0
+
+        fun push(value: Float) {
+            acc += value
+            count++
+            if (count >= stride) {
+                out.add((acc / stride).toFloat())
+                acc = 0.0
+                count = 0
+            }
+        }
+
+        fun retune(newStride: Int) {
+            if (count > 0) {
+                out.add((acc / count).toFloat())
+                acc = 0.0
+                count = 0
+            }
+            stride = newStride.coerceAtLeast(1)
+        }
+
+        fun flush() {
+            if (count > 0) {
+                out.add((acc / count).toFloat())
+                acc = 0.0
+                count = 0
+            }
+        }
+    }
+
+    private fun extractMonoSamplesDecimated(
+        buffer: java.nio.ByteBuffer,
+        bufferSize: Int,
+        presentationTimeUs: Long,
+        channelCount: Int,
+        sampleRate: Int,
+        pcmEncoding: Int,
+        startUs: Long,
+        endUs: Long,
+        sink: DecimatingSink,
+    ): Boolean {
+        val validChannels = if (channelCount > 0) channelCount else 1
+        val bytesPerSample = when (pcmEncoding) {
+            AudioFormat.ENCODING_PCM_FLOAT, AudioFormat.ENCODING_PCM_32BIT -> 4
+            AudioFormat.ENCODING_PCM_24BIT_PACKED -> 3
+            AudioFormat.ENCODING_PCM_8BIT -> 1
+            else -> 2
+        }
+        val bytesPerFrame = validChannels * bytesPerSample
+        val frameCount = bufferSize / bytesPerFrame
+        if (frameCount <= 0) return false
+
+        val frameDurationUs = 1_000_000.0 / sampleRate
+        if (presentationTimeUs >= 0L) {
+            val bufferEndUs = presentationTimeUs + (frameCount * frameDurationUs).toLong()
+            if (bufferEndUs < startUs) {
+                return false
+            }
+            if (presentationTimeUs > endUs) {
+                return true
+            }
+        }
+
+        for (i in 0 until frameCount) {
+            if (presentationTimeUs >= 0L) {
+                val frameTimeUs = presentationTimeUs + (i * frameDurationUs).toLong()
+                if (frameTimeUs < startUs) {
+                    buffer.position(buffer.position() + bytesPerFrame)
+                    continue
+                }
+                if (frameTimeUs > endUs) {
+                    return true
+                }
+            }
+
+            var sum = 0f
+            when (pcmEncoding) {
+                AudioFormat.ENCODING_PCM_FLOAT -> {
+                    for (ch in 0 until validChannels) {
+                        sum += buffer.float
+                    }
+                }
+                AudioFormat.ENCODING_PCM_8BIT -> {
+                    for (ch in 0 until validChannels) {
+                        val b = buffer.get().toInt() and 0xFF
+                        sum += (b - 128) / 128.0f
+                    }
+                }
+                AudioFormat.ENCODING_PCM_24BIT_PACKED -> {
+                    for (ch in 0 until validChannels) {
+                        val b0 = buffer.get().toInt() and 0xFF
+                        val b1 = buffer.get().toInt() and 0xFF
+                        val b2 = buffer.get().toInt()
+                        val sample = (b2 shl 16) or (b1 shl 8) or b0
+                        sum += sample / 8388608.0f
+                    }
+                }
+                AudioFormat.ENCODING_PCM_32BIT -> {
+                    for (ch in 0 until validChannels) {
+                        sum += (buffer.int.toDouble() / 2147483648.0).toFloat()
+                    }
+                }
+                else -> {
+                    for (ch in 0 until validChannels) {
+                        sum += buffer.short / 32768.0f
+                    }
+                }
+            }
+            sink.push(((sum / validChannels).coerceIn(-1.0f, 1.0f)))
+        }
+        return false
+    }
+
+    private fun extractMonoSamples(
+        buffer: java.nio.ByteBuffer,
+        bufferSize: Int,
+        presentationTimeUs: Long,
+        channelCount: Int,
+        sampleRate: Int,
+        pcmEncoding: Int,
+        startUs: Long,
+        endUs: Long,
+        collector: FloatChunkList,
+    ): Boolean {
+        val validChannels = if (channelCount > 0) channelCount else 1
+        val bytesPerSample = when (pcmEncoding) {
+            AudioFormat.ENCODING_PCM_FLOAT, AudioFormat.ENCODING_PCM_32BIT -> 4
+            AudioFormat.ENCODING_PCM_24BIT_PACKED -> 3
+            AudioFormat.ENCODING_PCM_8BIT -> 1
+            else -> 2
+        }
+        val bytesPerFrame = validChannels * bytesPerSample
+        val frameCount = bufferSize / bytesPerFrame
+        if (frameCount <= 0) return false
+
+        val frameDurationUs = 1_000_000.0 / sampleRate
+        if (presentationTimeUs >= 0L) {
+            val bufferEndUs = presentationTimeUs + (frameCount * frameDurationUs).toLong()
+            if (bufferEndUs < startUs) {
+                return false
+            }
+            if (presentationTimeUs > endUs) {
+                return true
+            }
+        }
+
+        for (i in 0 until frameCount) {
+            if (presentationTimeUs >= 0L) {
+                val frameTimeUs = presentationTimeUs + (i * frameDurationUs).toLong()
+                if (frameTimeUs < startUs) {
+                    buffer.position(buffer.position() + bytesPerFrame)
+                    continue
+                }
+                if (frameTimeUs > endUs) {
+                    return true
+                }
+            }
+
+            var sum = 0f
+            when (pcmEncoding) {
+                AudioFormat.ENCODING_PCM_FLOAT -> {
+                    for (ch in 0 until validChannels) {
+                        sum += buffer.float
+                    }
+                }
+                AudioFormat.ENCODING_PCM_8BIT -> {
+                    for (ch in 0 until validChannels) {
+                        val b = buffer.get().toInt() and 0xFF
+                        sum += (b - 128) / 128.0f
+                    }
+                }
+                AudioFormat.ENCODING_PCM_24BIT_PACKED -> {
+                    for (ch in 0 until validChannels) {
+                        val b0 = buffer.get().toInt() and 0xFF
+                        val b1 = buffer.get().toInt() and 0xFF
+                        val b2 = buffer.get().toInt()
+                        val sample = (b2 shl 16) or (b1 shl 8) or b0
+                        sum += sample / 8388608.0f
+                    }
+                }
+                AudioFormat.ENCODING_PCM_32BIT -> {
+                    for (ch in 0 until validChannels) {
+                        sum += (buffer.int.toDouble() / 2147483648.0).toFloat()
+                    }
+                }
+                else -> {
+                    for (ch in 0 until validChannels) {
+                        sum += buffer.short / 32768.0f
+                    }
+                }
+            }
+            val mono = (sum / validChannels).coerceIn(-1.0f, 1.0f)
+            collector.add(mono)
+        }
+        return false
+    }
+}

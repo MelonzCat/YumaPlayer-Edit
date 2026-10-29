@@ -1,0 +1,89 @@
+/*
+ * YumaPlayer (2026) | Original work by MuwMix
+ * https://github.com/MuwMx/YumaPlayer
+ * GPL-3.0 License | Contributors: see git history
+ */
+
+package moe.rukamori.archivetune.ui.player.player_0.scoped
+
+import android.os.Build
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.PredictiveBackHandler
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.util.lerp
+import kotlinx.coroutines.launch
+import moe.rukamori.archivetune.ui.state.PlayerSheetState
+import kotlin.coroutines.cancellation.CancellationException
+
+/**
+ * Обработчик системного жеста "Назад".
+ * Поддерживает предиктивную анимацию (Predictive Back) для Android 14+.
+ */
+@Composable
+internal fun PlayerSheetPredictiveBackHandler(
+    enabled: Boolean,
+    currentSheetState: PlayerSheetState,
+    predictiveBackFractionValue: Float,
+    onPredictiveBackFractionChanged: (Float) -> Unit,
+    sheetCollapsedTargetY: Float,
+    sheetExpandedTargetY: Float,
+    sheetMotionController: SheetMotionController,
+    animationDurationMs: Int,
+    onSwipeEdgeChanged: (Int?) -> Unit,
+    onCollapse: () -> Unit,
+    onExpand: () -> Unit,
+    registrationKey: Any?
+) {
+    val scope = rememberCoroutineScope()
+
+    key(registrationKey) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            PredictiveBackHandler(enabled = enabled) { progressFlow ->
+                var actualProgress = 0f
+                var isCompleted = false
+
+                try {
+                    progressFlow.collect { backEvent ->
+                        actualProgress = backEvent.progress
+                        onSwipeEdgeChanged(backEvent.swipeEdge)
+                        onPredictiveBackFractionChanged(actualProgress)
+                    }
+                    isCompleted = true
+                } catch (_: CancellationException) {
+                    scope.launch {
+                        Animatable(actualProgress).animateTo(
+                            targetValue = 0f,
+                            animationSpec = tween(animationDurationMs)
+                        ) {
+                            onPredictiveBackFractionChanged(this.value)
+                        }
+                        onSwipeEdgeChanged(null)
+                    }
+                }
+
+                if (isCompleted) {
+                    val currentVisualY = lerp(sheetExpandedTargetY, sheetCollapsedTargetY, actualProgress)
+                    val currentVisualExpansionFraction = (1f - actualProgress).coerceIn(0f, 1f)
+
+                    sheetMotionController.snapTo(
+                        translationYValue = currentVisualY,
+                        expansionFractionValue = currentVisualExpansionFraction
+                    )
+
+                    onPredictiveBackFractionChanged(0f)
+                    onSwipeEdgeChanged(null)
+
+                    onCollapse()
+                }
+            }
+        } else {
+            BackHandler(enabled = enabled) {
+                onCollapse()
+            }
+        }
+    }
+}

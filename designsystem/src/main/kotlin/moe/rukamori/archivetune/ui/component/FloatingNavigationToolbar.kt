@@ -1,0 +1,224 @@
+@file:OptIn(dev.chrisbanes.haze.ExperimentalHazeApi::class)
+
+package moe.rukamori.archivetune.ui.component
+
+import androidx.compose.animation.core.EaseOut
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.wrapContentSize
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.lerp
+import dev.chrisbanes.haze.HazeInput
+import dev.chrisbanes.haze.HazePerformanceMode
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.blur.HazeBlurStyle
+import dev.chrisbanes.haze.blur.HazeColorEffect
+import dev.chrisbanes.haze.blur.hazeBlur
+import moe.rukamori.archivetune.constants.NavigationBarCornerRadius
+import moe.rukamori.archivetune.constants.NavigationBarHeight
+import moe.rukamori.archivetune.constants.NavigationBarHideMinScale
+import moe.rukamori.archivetune.constants.NavigationBarHideOffsetY
+import moe.rukamori.archivetune.constants.NavigationBarInnerPaddingHorizontal
+import moe.rukamori.archivetune.constants.NavigationBarOverflowPaddingHorizontal
+import moe.rukamori.archivetune.constants.NavigationBarVisibilityDurationMs
+import moe.rukamori.archivetune.ui.screens.Screens
+import moe.rukamori.archivetune.ui.settings.SettingsDimensions
+import moe.rukamori.archivetune.ui.theme.glassStroke
+
+internal object NavBarColors {
+    @Composable
+    fun container(pureBlack: Boolean) = if (pureBlack) Color.Black else MaterialTheme.colorScheme.surfaceContainer
+
+    @Composable
+    fun iconActive(pureBlack: Boolean) = if (pureBlack) Color.White else MaterialTheme.colorScheme.primary
+
+    @Composable
+    fun iconInactive(pureBlack: Boolean) = if (pureBlack) Color.White.copy(alpha = 0.6f) else MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+@Composable
+fun FloatingNavigationToolbar(
+    items: List<Screens>,
+    pureBlack: Boolean,
+    modifier: Modifier = Modifier,
+    capsuleShape: Shape = RoundedCornerShape(NavigationBarCornerRadius),
+    hazeState: HazeState? = null,
+    blurRadius: Float = SettingsDimensions.BlurRadiusDefault,
+    showBorder: Boolean = true,
+    blurEnabled: Boolean = true,
+    visibilityFactor: Float = 1f,
+    onShuffleClick: (() -> Unit)? = null,
+    shuffleIconRes: Int? = null,
+    shuffleContentDescription: String = "",
+    onMusicRecognitionClick: (() -> Unit)? = null,
+    musicRecognitionContentDescription: String = "",
+    onMusicTogetherClick: (() -> Unit)? = null,
+    isSelected: (Screens) -> Boolean,
+    onItemClick: (Screens, Boolean) -> Unit,
+    onSearchItemDoubleClick: (() -> Unit)? = null,
+) {
+    val hasOverflow = false
+    val containerColor = NavBarColors.container(pureBlack)
+
+    val fixedTintAlpha = if (pureBlack) SettingsDimensions.HazePureBlackTintAlpha else SettingsDimensions.HazeDefaultTintAlpha
+    val hazeStyle = remember(containerColor, blurRadius, pureBlack, blurEnabled) {
+        val tintEffect = HazeColorEffect.tint(containerColor.copy(alpha = fixedTintAlpha))
+        HazeBlurStyle {
+            blurEnabled(blurEnabled)
+            backgroundColor(containerColor)
+            colorEffects(listOf(tintEffect))
+            fallbackColorEffect(tintEffect)
+            blurRadius(blurRadius.dp)
+            noiseFactor(SettingsDimensions.HazeNoiseFactor)
+        }
+    }
+
+    val shadowPaint = rememberNavigationShadowPaint()
+
+    val animatedVisibilityFactor by animateFloatAsState(
+        targetValue = visibilityFactor.coerceIn(0f, 1f),
+        animationSpec = tween(
+            durationMillis = NavigationBarVisibilityDurationMs,
+            easing = EaseOut,
+        ),
+        label = "FloatingToolbarVisibility",
+    )
+
+    val gestureState = rememberNavigationBarGestureState(
+        items = items,
+        isSelected = isSelected,
+        onItemClick = onItemClick,
+    )
+
+    val selectedIndex = items.indexOfFirst { isSelected(it) }
+
+    androidx.compose.runtime.LaunchedEffect(
+        selectedIndex,
+        gestureState.selectorState.rowWidthPx,
+        gestureState.isDragging,
+    ) {
+        if (
+            selectedIndex >= 0 &&
+            !gestureState.isDragging &&
+            gestureState.selectorState.tabWidthPx > 0f
+        ) {
+            gestureState.selectorState.syncToTab(selectedIndex)
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .graphicsLayer {
+                val hideOffsetY = NavigationBarHideOffsetY.toPx() * (1f - animatedVisibilityFactor)
+                translationY = hideOffsetY + gestureState.barTranslationYAnimatable.value
+                translationX = gestureState.barTranslationXAnimatable.value
+
+                val baseScale = lerp(NavigationBarHideMinScale, 1.0f, animatedVisibilityFactor)
+                val scale = baseScale * gestureState.barScaleAnimatable.value
+                scaleX = scale
+                scaleY = scale
+                alpha = animatedVisibilityFactor
+            }
+            .fillMaxWidth()
+            .height(NavigationBarHeight)
+            .navigationShapeShadow(capsuleShape, shadowPaint)
+            .clip(capsuleShape)
+            .then(
+                if (hazeState != null) {
+                    Modifier.hazeBlur(
+                        input = HazeInput.Sources(hazeState),
+                        style = hazeStyle,
+                        performanceMode = HazePerformanceMode.Fixed(SettingsDimensions.HazeQualityFraction),
+                    )
+                } else {
+                    Modifier.background(containerColor)
+                },
+            )
+            .then(
+                if (showBorder) {
+                    Modifier.glassStroke(
+                        shape = capsuleShape,
+                        strokeWidth = SettingsDimensions.GlassBorderThickness,
+                        topAlpha = SettingsDimensions.GlassBorderTopAlpha,
+                        bottomAlpha = SettingsDimensions.GlassBorderBottomAlpha,
+                        topColor = Color.White,
+                        bottomColor = Color.Black,
+                    )
+                } else {
+                    Modifier
+                },
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = NavigationBarInnerPaddingHorizontal),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            NavigationDragSelectorOverlay(gestureState.selectorState)
+
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .navigationTabDragGestures(gestureState),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                items.forEach { screen ->
+                    val selected = isSelected(screen)
+                    NavigationTabItem(
+                        screen = screen,
+                        selected = selected,
+                        pureBlack = pureBlack,
+                        drawSelector = false,
+                        onClick = {
+                            gestureState.selectorState.onTabTap(screen, selected)
+                        },
+                        onDoubleClick = remember(screen, onSearchItemDoubleClick) {
+                            if (screen == Screens.Search) onSearchItemDoubleClick else null
+                        },
+                    )
+                }
+
+                if (hasOverflow) {
+                    Box(
+                        modifier = Modifier
+                            .padding(
+                                start = NavigationBarOverflowPaddingHorizontal,
+                                end = NavigationBarOverflowPaddingHorizontal,
+                            )
+                            .wrapContentSize(),
+                    ) {
+                        ToolbarOverflowMenu(
+                            pureBlack = pureBlack,
+                            onShuffleClick = onShuffleClick,
+                            shuffleIconRes = shuffleIconRes,
+                            shuffleContentDescription = shuffleContentDescription,
+                            onMusicRecognitionClick = onMusicRecognitionClick,
+                            musicRecognitionContentDescription = musicRecognitionContentDescription,
+                            onMusicTogetherClick = onMusicTogetherClick,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
